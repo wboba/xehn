@@ -512,8 +512,11 @@ func applyIPWho(n *VPNGateNode, r ipWhoResult) {
 		n.Class, n.ClassSource = "residential", "ipwho"
 	case n.Class == "unknown" || n.Class == "":
 		// 两个源都没有明确结论：走启发式二分，保证界面上不再出现「未分类」。
+		// fork 修正（2026-11-12）：ASN 必须带 "AS" 前缀再传——parseASN 不认纯
+		// 数字串、直接返回 0，原来这里传 strconv.Itoa 的裸数字，导致硬机房 ASN
+		// 表在这条路径上永远命中不了，云厂商节点被默认判成家宽。
 		blob := strings.ToLower(isp + " " + r.Connection.Org)
-		n.Class = heuristicClass(strconv.Itoa(r.Connection.ASN), blob)
+		n.Class = heuristicClass("AS"+strconv.Itoa(r.Connection.ASN), blob)
 		n.ClassSource = "ipwho+heur"
 	}
 }
