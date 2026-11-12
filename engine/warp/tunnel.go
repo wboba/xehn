@@ -309,22 +309,40 @@ func (s *ipStack) fetch(ctx context.Context, timeout time.Duration) (string, boo
 // 一模一样（都写成「数据面不通」），而它们的处理方式完全不同 —— 前两种会
 // 把能用的端点误判成死端点，真机已经踩过两次。
 func (s *ipStack) fetchReason(ctx context.Context, timeout time.Duration) (string, string, bool) {
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	// fork 修正（2026-11-12）：三档不能再共用同一个超时上下文。原来 /meta 一档
+	// 遇上黑洞式丢包（移动网络最常见的超时型失败）会把整个 timeout 吃满，后两
+	// 档拿到的是已过期的 ctx 必然立即失败——尤其为防「DNS 挂了把好隧道判死」
+	// 专设的 IP 字面量档，形同虚设。现在总预算仍由 timeout 封顶，每档有自己
+	// 的子超时（各三分之一），字面量档用剩余的全部时间。
+	overall, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if resolveMetaAddr(reqCtx, s.tnet) {
-		s.client.Timeout = timeout
-		if body, ok := fetchMeta(reqCtx, s.client, metaURL); ok {
+	tier := timeout / 3
+	if tier <= 0 {
+		tier = timeout
+	}
+	resolveCtx, cancelResolve := context.WithTimeout(overall, tier)
+	resolved := resolveMetaAddr(resolveCtx, s.tnet)
+	cancelResolve()
+	if resolved {
+		s.client.Timeout = tier
+		metaCtx, cancelMeta := context.WithTimeout(overall, tier)
+		body, ok := fetchMeta(metaCtx, s.client, metaURL)
+		cancelMeta()
+		if ok {
 			return body, "", true
 		}
-		if body, ok := fetchMeta(reqCtx, s.client, traceURL); ok {
+		traceCtx, cancelTrace := context.WithTimeout(overall, tier)
+		body, ok = fetchMeta(traceCtx, s.client, traceURL)
+		cancelTrace()
+		if ok {
 			return body, "", true
 		}
 	}
 	// DNS 不通或上面两档被出口拒绝：改用 IP 字面量，这一步不需要任何解析。
-	if body, ok := s.fetchLiteral(reqCtx, timeout); ok {
+	if body, ok := s.fetchLiteral(overall, timeout); ok {
 		return body, "", true
 	}
-	if reqCtx.Err() != nil {
+	if overall.Err() != nil {
 		return "", "隧道内请求超时", false
 	}
 	return "", "隧道内请求失败（DNS 或被出口拒绝）", false
