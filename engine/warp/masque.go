@@ -1307,10 +1307,25 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 		} else {
 			endpoint = cands[i]
 			i++
-			attempts++
-			if dialErr := tn.handshakeErr(ctx, endpoint, o.HandshakeTimeout); dialErr != nil {
-				lastDialErr = dialErr
+			// fork 修正（2026-11-12）：同一端点试满 masqueDefaultAttempts 次再换
+			// 下一个。作者在扫描路径实测过（见 masqueDefaultAttempts 的注释）：
+			// 同一批端点试 1 次只过 1-3/14、试 3 次过 11-13/14——「这次不答」在
+			// 移动网络上说明不了任何问题。但正式拨号原来只试 1 次就判死端点，
+			// 尤其 NoHedge 的串行路（VPN Gate / Psiphon 的上游都走它）受害最
+			// 重，与作者自己的实测结论脱节。重试仍受上面的 deadline 约束。
+			var dialErr error
+			for try := 0; try < masqueDefaultAttempts; try++ {
+				attempts++
+				if dialErr = tn.handshakeErr(ctx, endpoint, o.HandshakeTimeout); dialErr == nil {
+					break
+				}
 				o.report(fmt.Sprintf("%s 拨号失败：%v", endpoint, dialErr))
+				if ctx.Err() != nil || time.Now().After(deadline) {
+					break
+				}
+			}
+			if dialErr != nil {
+				lastDialErr = dialErr
 				continue
 			}
 		}
@@ -1343,7 +1358,13 @@ func dialMasque(ctx context.Context, o Options) (*Session, error) {
 			}
 		}
 		// 上行并行：先把可用会话交给用户，其余几条在后台补齐（补失败不影响连接）。
-		if !o.NoHedge && !o.NoParallelUplink {
+		//
+		// fork 修正（2026-11-12）：这里只该看 NoParallelUplink。原来连带要求
+		// !NoHedge，于是只想关「拨号竞速」的上游（VPN Gate / Psiphon 都设
+		// NoHedge:true）连带失去了 3 条上行并行——两个开关在 session.go 里是
+		// 明确独立定义的，这里的连带是误伤：单条 QUIC 上行会被它自己的拥塞
+		// 窗口卡在十几 Mb/s（见 masqueUploadConns 的注释）。
+		if !o.NoParallelUplink {
 			tn.growConns(endpoint, 6*time.Second, o.report)
 		}
 		ok = true
