@@ -1215,20 +1215,29 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
             .padding(start = 8.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // 一行只留名字 + 结果：IP:port、ISP、共享 都是用户明确说「太长、不要」的东西。
-        // 需要 IP 时去看引擎日志 —— 每次尝试都会打印带 ip:port 的完整节点名。
-        Text(
-            slot,
-            style = MaterialTheme.typography.labelMedium,
-            modifier = Modifier.weight(1f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            color = when (n.cls) {
-                "residential" -> Color(0xFF1B7F3B)
-                "datacenter" -> Color(0xFF8A6D3B)
-                else -> MaterialTheme.colorScheme.onSurfaceVariant
-            },
-        )
+        // fork 改动（2026-11-12）：上游只显示名字 + 结果（IP 被其用户以「太长」
+        // 为由去掉）；本 fork 的用户明确要求节点带位置和 IP —— 数据本来就都在
+        // 节点对象里，于是在名字下面加一行小字「位置 · IP」，纯展示层改动。
+        Column(Modifier.weight(1f)) {
+            Text(
+                slot,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = when (n.cls) {
+                    "residential" -> Color(0xFF1B7F3B)
+                    "datacenter" -> Color(0xFF8A6D3B)
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            Text(
+                "${countryNameOf(n.cc, n.country)} · ${n.ip}",
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Spacer(Modifier.width(8.dp))
         Text(
             tail,
@@ -1257,6 +1266,39 @@ private fun classRankOf(cls: String): Int = when (cls) {
 private fun classKeyOf(cls: String): String = when (cls) {
     "residential", "datacenter" -> cls
     else -> "unknown"
+}
+
+/**
+ * fork 加的国家代码 → 中文名（节点行「位置 · IP」小字用）。只收 VPN Gate
+ * 常见的国家；查不到就用引擎给的英文名，再没有就显示代码本身。
+ */
+private fun countryNameOf(cc: String, fallback: String): String {
+    val name = when (cc.uppercase()) {
+        "JP" -> "日本"; "KR" -> "韩国"; "US" -> "美国"; "CA" -> "加拿大"
+        "CN" -> "中国"; "TW" -> "台湾"; "HK" -> "香港"; "SG" -> "新加坡"
+        "GB" -> "英国"; "IE" -> "爱尔兰"; "DE" -> "德国"; "FR" -> "法国"
+        "NL" -> "荷兰"; "IT" -> "意大利"; "ES" -> "西班牙"; "PT" -> "葡萄牙"
+        "PL" -> "波兰"; "CZ" -> "捷克"; "AT" -> "奥地利"; "CH" -> "瑞士"
+        "BE" -> "比利时"; "DK" -> "丹麦"; "SE" -> "瑞典"; "NO" -> "挪威"
+        "FI" -> "芬兰"; "IS" -> "冰岛"; "GR" -> "希腊"; "RO" -> "罗马尼亚"
+        "HU" -> "匈牙利"; "UA" -> "乌克兰"; "RU" -> "俄罗斯"; "TR" -> "土耳其"
+        "IL" -> "以色列"; "AE" -> "阿联酋"; "SA" -> "沙特阿拉伯"
+        "IN" -> "印度"; "PK" -> "巴基斯坦"; "BD" -> "孟加拉"; "LK" -> "斯里兰卡"
+        "NP" -> "尼泊尔"; "TH" -> "泰国"; "VN" -> "越南"; "MY" -> "马来西亚"
+        "ID" -> "印度尼西亚"; "PH" -> "菲律宾"; "KH" -> "柬埔寨"; "LA" -> "老挝"
+        "MM" -> "缅甸"; "MN" -> "蒙古"; "AU" -> "澳大利亚"; "NZ" -> "新西兰"
+        "ZA" -> "南非"; "EG" -> "埃及"; "NG" -> "尼日利亚"; "KE" -> "肯尼亚"
+        "BR" -> "巴西"; "MX" -> "墨西哥"; "AR" -> "阿根廷"; "CL" -> "智利"
+        "CO" -> "哥伦比亚"; "PE" -> "秘鲁"; "VE" -> "委内瑞拉"
+        "KZ" -> "哈萨克斯坦"; "UZ" -> "乌兹别克斯坦"; "BY" -> "白俄罗斯"
+        "LT" -> "立陶宛"; "LV" -> "拉脱维亚"; "EE" -> "爱沙尼亚"
+        "LU" -> "卢森堡"; "MT" -> "马耳他"; "CY" -> "塞浦路斯"
+        "GE" -> "格鲁吉亚"; "AM" -> "亚美尼亚"; "AZ" -> "阿塞拜疆"
+        "IR" -> "伊朗"; "IQ" -> "伊拉克"; "JO" -> "约旦"; "KW" -> "科威特"
+        "OM" -> "阿曼"; "QA" -> "卡塔尔"; "BH" -> "巴林"
+        else -> null
+    }
+    return name ?: fallback.ifBlank { cc }
 }
 
 /**
