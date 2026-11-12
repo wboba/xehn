@@ -398,7 +398,10 @@ func (e *Engine) TestOpenVPNNodes(idsCSV string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	e.sess.logf("[engine] 开始真实握手测速：%d 个节点（只握手，不建系统 VPN）", len(ids))
-	probes, err := wb.TestOpenVPNNodes(ctx, ids, "", 0, func(s string) {
+	// fork 修正（2026-11-12）：握手超时传当前配置值，不要写死 0——写死 0 会在
+	// TestOpenVPNNodes 里回退到 3s 默认，用户在设置里调大的超时永远传不到
+	// 测速建上游这一步，慢端点连测速的上游都建不起来。
+	probes, err := wb.TestOpenVPNNodes(ctx, ids, "", wb.currentHandshake(), func(s string) {
 		e.sess.logf("[probe] %s", s)
 	})
 	if err != nil {
