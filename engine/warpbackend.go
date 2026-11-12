@@ -620,6 +620,20 @@ func loadEndpointCache(path string) map[string]string {
 // 网络 RTT 更大，给到 3s，否则好端点会被自己的超时误判掉。
 const defaultHandshakeTimeout = 3 * time.Second
 
+// currentHandshake 返回当前配置的单端点握手超时（未设置时用默认值）。
+//
+// fork 修正（2026-11-12）：此前多条路径把 3s 写死或传 0（如引擎的节点测速
+// 入口传 0、Psiphon 两处写死 3s），用户在设置里调大的超时永远传不到那些
+// 路径——慢端点在那些路径上被 3s 误杀，用户却以为是自己的设置没生效。
+func (b *warpBackend) currentHandshake() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.handshake <= 0 {
+		return defaultHandshakeTimeout
+	}
+	return b.handshake
+}
+
 // SetTimeout 设置单端点握手超时（秒）。0 表示用默认值。
 func (b *warpBackend) SetTimeout(sec int) {
 	b.mu.Lock()
@@ -730,7 +744,7 @@ func (b *warpBackend) RefreshPsiphonRegions(ctx context.Context, report func(str
 		DNS:              dns,
 		DataDir:          filepath.Join(b.workDir, "psiphon"),
 		UnderlayProto:    "awg",
-		HandshakeTimeout: 3 * time.Second,
+		HandshakeTimeout: b.currentHandshake(),
 		Budget:           70 * time.Second,
 		RegionsOnly:      true,
 		Report:           report,
@@ -795,7 +809,7 @@ func (b *warpBackend) ProbePsiphonRegions(
 	report("地区测速：先建一条 WARP 上游（各地区共用）…")
 	under, err := warp.OpenPsiphonUnderlay(budgetCtx, warp.PsiphonOptions{
 		UnderlayProto:    "awg",
-		HandshakeTimeout: 3 * time.Second,
+		HandshakeTimeout: b.currentHandshake(),
 		VerifyTimeout:    10 * time.Second,
 		Budget:           60 * time.Second,
 		Report:           report,
