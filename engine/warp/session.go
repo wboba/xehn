@@ -223,20 +223,14 @@ func dialWGTunnel(ctx context.Context, o Options, run protoRun) (*Session, error
 	}
 	o.report(fmt.Sprintf("候选端点 %d 个 × 端口 %v（%s），预算 %s", len(cands), o.Ports, o.Proto, o.Budget))
 
-	// 端点在外层、端口在内层：每个端点把端口都试一遍，再换下一个端点。
-	//
-	// fork 修正（2026-11-12）：原来是端口在外层——先在第一个端口上把全部候选
-	// 试完才轮到下一个端口。但候选约 28 个、单次握手超时 2.5s，光第一轮就要
-	// ~70s，早已超过 45s 的总预算：第一个端口被运营商封掉的网络里（移动网络
-	// 并不少见），备用端口永远轮不到，上游直接判死，架在它上面的 VPN Gate
-	// 节点跟着全部连不上。端点在外层时第一个端点就会把所有端口都试到（有
-	// Prefer 时上次成功的端口本来就排第一），「端口被墙」在第一个端点上就能
-	// 排掉，不再靠试满整池来发现。
+	// 端口在外层、端点在内存：先在同一个端口上把候选试一遍，再换端口。
+	// 这样「端口被墙」的网络能在第一轮就排掉端口，而不用为每个端点把
+	// 四个端口都等一遍。
 	deadline := time.Now().Add(o.Budget)
 	attempts := 0
 	var lastErr error
-	for _, ip := range cands {
-		for _, port := range o.Ports {
+	for _, port := range o.Ports {
+		for _, ip := range cands {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
