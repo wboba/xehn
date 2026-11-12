@@ -970,7 +970,15 @@ func dialOpenVPNUpstream(
 
 	// TCP/UDP 都走 gVisor，系统的路由表完全不参与，所以这一步在系统 VPN
 	// 建起来之前就能完成。
-	conn, err := dialThroughStack(ctx, stack, cfg.Proto, nodeAddr, o.HandshakeTimeout)
+	// fork 修正（2026-11-12）：拨号超时不能跟着端点握手的 3s 默认值走。这一步是
+	// 「穿 WARP 隧道 + 跨境 RTT + 家宽节点应答」的完整 TCP 建连，3s 在移动网络上
+	// 经常不够，慢节点在握手开始前就被判死。给 10s 地板；未设置（<=0）时保持
+	// dialThroughStack 自带的 15s 默认。
+	dialTimeout := o.HandshakeTimeout
+	if dialTimeout > 0 && dialTimeout < 10*time.Second {
+		dialTimeout = 10 * time.Second
+	}
+	conn, err := dialThroughStack(ctx, stack, cfg.Proto, nodeAddr, dialTimeout)
 	if err != nil {
 		under.Close()
 		return nil, nil, nil, fmt.Errorf("经 WARP 连接节点失败: %w", err)
@@ -1055,12 +1063,17 @@ func dialThroughStack(ctx context.Context, stack *ipStack, proto, addr string, t
 
 // handshakeWindow 给单次 OpenVPN 握手一个上限。VPN Gate 节点的握手实测
 // 4.8–12.5s，给 25s 既不会把慢节点误杀，也不会让界面无休止转。
+//
+// fork 修正（2026-11-12）：原来 d<10s 时只给 10s，低于上面实测的上限 12.5s——
+// 默认设置（d=3s）下，握手慢于 10s 的节点**永远**连不上，日本家宽节点首当其冲
+// （用户实测日本节点一个都连不上）。地板抬到 20s：覆盖 12.5s 实测上限再加余量，
+// 又不至于让死节点把界面拖太久（失败还有一次重试兜底）。
 func handshakeWindow(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 25 * time.Second
 	}
 	if d < 10*time.Second {
-		return 10 * time.Second
+		return 20 * time.Second
 	}
 	return d * 2
 }
