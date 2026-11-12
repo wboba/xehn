@@ -446,11 +446,12 @@ func (b *warpBackend) TestOpenVPNNodes(
 	}
 	defer under.Close()
 
-	// 并发 6、单节点 10s：真机实测好看的节点握手 2.8–4.9s，10s 足够分辨；
-	// 而「控制通道无响应」的节点一定要等满超时，所以并发数直接决定总时长 ——
-	// 98 个节点最坏 98×10/6 ≈ 2.7 分钟，实际大多在 1 分钟内。
-	const probeTimeout = 10 * time.Second
-	// 并发 8：每个节点是「握手 + 2s 测速」，98 个最坏约 98×(10+2)/8 ≈ 2.5 分钟。
+	// 并发 6、单节点 15s：真机实测好看的节点握手 2.8–4.9s，但慢节点（尤其日本
+	// 家宽）握手能到 12.5s（见 openvpn.go handshakeWindow 处的实测注），10s 会
+	// 把它们在列表阶段就误判掉。fork 于 2026-11-12 把上限抬到 15s：98 个节点
+	// 最坏 98×15/6 ≈ 4 分钟，实际大多在 1 分钟内（只有死节点才等满超时）。
+	const probeTimeout = 15 * time.Second
+	// 并发 8：每个节点是「握手 + 2s 测速」，98 个最坏约 98×(15+2)/8 ≈ 3.5 分钟。
 	const workers = 8
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
