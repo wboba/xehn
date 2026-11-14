@@ -5,6 +5,32 @@
 
 ---
 
+## 0.2.57-fix3（fork 构建，2026-11-15）
+
+真机现象：测速能握手成功的日本节点，正式连接却握手必死（错误为
+`read hard reset response after 0 retransmits: context deadline exceeded`）。
+审计后确认超时值本身没问题（连接路径握手窗 20s 比测速的 15s 还宽，上游
+搭建也不吃握手预算），问题出在下面三处，逐一修复：
+
+- **正式连接复用单条 WARP 上游**（`warpbackend.connectOpenVPN` +
+  `warp.DialOpenVPN` 新增可选的预建上游入参 `OpenVPNOptions.Underlay`）：
+  以前每个候选、每次重试都新抽一条上游——端点重新采样，新上游只验过
+  一个 HTTPS 请求，就要撑 20s 的 OpenVPN 控制通道往返；测速则全程复用
+  一条已验证的上游，两边根本不是同一种抽奖。现在连接前先建一条，本轮
+  全部候选与内部重试共用，所有权归 `connectOpenVPN`（成功时随 Session
+  转交）。没传预建上游的调用方保持旧行为。测速路径（`TestOpenVPNNodes`）
+  与刷新抓取路径（session/tunnel/vpngate）未动。
+- **TCP 节点的 hard reset 应答等待加分片读 + 重传**（`third_party/mihomo/
+  openvpn` 的 `waitServerReset`）：以前只有 UDP 分支把读切成 1s 小片并
+  重发 reset，TCP 是整窗单次阻塞读、零重传，应答丢一次就必死。现在 TCP
+  同样分片读，窗口内至多重发 3 次；错误字符串格式不变（N 为实际重传
+  数）。UDP 行为不变。
+- **摘掉连接前的上游测速诊断**（`dialOpenVPNUpstream` 不再调用
+  `diagUnderlaySpeed`）：它在拨节点前先跑 1 流 + 4 流下载，把刚建好的
+  上游和跨境带宽压塞一阵，慢节点更容易在随后的握手里超时。函数本体
+  保留供显式诊断；影响仅是连接日志里不再出现「诊断：WARP 上游 1 流
+  ≈ …」一行。
+
 ## 0.2.57-fix2（fork 构建，2026-11-14）
 
 - **节点行第二行新增质量等级与 IP 类型显示**（纯 UI 改动，引擎零改动）：
