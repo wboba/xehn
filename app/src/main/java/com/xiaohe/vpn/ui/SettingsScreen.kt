@@ -1316,13 +1316,51 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
-            Text(
-                "${countryNameOf(n.cc, n.country)} · ${n.ip}",
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            // fork 改动（2026-11-14，0.2.57-fix2）：第二行在 fix4 的
+            // 「国家 · IP」前面再加两段——质量等级（优/良/差，见
+            // qualityGradeOf）和 IP 类型（按 n.cls 显示 住宅/机房/未知，
+            // 与第一行槽位名同色系）。数据都用节点对象现成字段，纯展示层
+            // 改动；整行用 Row 拼段，国家·IP 段带 weight + 省略号，
+            // 保证单行不溢出。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val grade = qualityGradeOf(n)
+                if (grade != null) {
+                    Text(
+                        grade.first,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        color = grade.second,
+                    )
+                    Text(
+                        " · ",
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    when (n.cls) {
+                        "residential" -> "住宅"
+                        "datacenter" -> "机房"
+                        else -> "未知"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    color = when (n.cls) {
+                        "residential" -> Color(0xFF1B7F3B)
+                        "datacenter" -> Color(0xFF8A6D3B)
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+                Text(
+                    " · ${countryNameOf(n.cc, n.country)} · ${n.ip}",
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
         Spacer(Modifier.width(8.dp))
         Text(
@@ -1352,6 +1390,43 @@ private fun classRankOf(cls: String): Int = when (cls) {
 private fun classKeyOf(cls: String): String = when (cls) {
     "residential", "datacenter" -> cls
     else -> "unknown"
+}
+
+/**
+ * fork 加的节点质量等级（2026-11-14，0.2.57-fix2，节点行第二行行首用）。
+ *
+ * 数据来源都是节点对象现成字段：延迟优先用实测 `latencyMs`（引擎真测的
+ * TCP 延迟），没有实测时用 VPNGate 自报的 `pingMs`，两者都没有就不显示
+ * 等级（返回 null）；速度用实测优先的口径——`probeBps`（这次握手测速）
+ * → `measuredBps`（上次连接实测）→ `speedBps`（自报）。延迟 ≤120ms 优、
+ * ≤300ms 良、其余差；但有效速度低于 2 Mbps 时「优」封顶降为「良」，
+ * 免得延迟低但带宽跑不动的节点标优误导人。
+ */
+private fun qualityGradeOf(n: VpnGateNode): Pair<String, Color>? {
+    val lat = when {
+        n.latencyMs > 0 -> n.latencyMs
+        n.pingMs > 0 -> n.pingMs
+        else -> return null
+    }
+    var grade = when {
+        lat <= 120 -> "优"
+        lat <= 300 -> "良"
+        else -> "差"
+    }
+    val effSpeed = when {
+        n.probeBps > 0 -> n.probeBps
+        n.measuredBps > 0 -> n.measuredBps
+        else -> n.speedBps.toLong()
+    }
+    if (grade == "优" && effSpeed > 0 && effSpeed < 2_000_000L) {
+        grade = "良"
+    }
+    val color = when (grade) {
+        "优" -> Color(0xFF1B7F3B)
+        "良" -> Color(0xFF8A6D3B)
+        else -> Color(0xFFB3261E)
+    }
+    return grade to color
 }
 
 /**
