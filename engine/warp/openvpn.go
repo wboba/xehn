@@ -242,6 +242,13 @@ type OpenVPNOptions struct {
 	VerifyTimeout    time.Duration
 	Budget           time.Duration
 
+	// Underlay 是调用方预建好的 WARP 上游（可空）。非空时 dialOpenVPNUpstream
+	// 直接用它，且**不负责关闭**——所有权归调用方（一轮连接里多个候选、多次
+	// 重试共用一条，见 warpbackend.connectOpenVPN）；成功时返回的 Session 就是
+	// 它本身，所有权随 Session 交出。为空时保持旧行为：每次尝试自己
+	// OpenUnderlay、失败自己关。
+	Underlay *Session
+
 	// PrepareTun 在握手成功后调用：上层用这些参数建系统 VPN 并返回 fd。
 	// 这是本流程唯一需要回调 Android 的地方（VpnService.Builder 只能在 Java 侧调）。
 	PrepareTun func(OpenVPNTun) (int, error)
@@ -485,9 +492,11 @@ func DialOpenVPN(ctx context.Context, o OpenVPNOptions) (*Session, error) {
 	}
 	// ok 只在真正把会话交出去之后置位；中途任何 return 都要把上游隧道关掉，
 	// 否则一条 netstack 隧道会留在后台空转（系统看不到，日志里也看不出来）。
+	// 例外：预建上游（o.Underlay）的所有权在调用方，本轮失败也不能关——
+	// 后面的候选还要接着用它。
 	ok := false
 	defer func() {
-		if !ok && under != nil {
+		if !ok && under != nil && under != o.Underlay {
 			under.Close()
 		}
 	}()
@@ -902,6 +911,11 @@ func probeDownloadBpsSlow(stack *ipStack, budget time.Duration) (int64, string) 
 //
 // 判据：这一行要是也只有几百 KB/s，瓶颈在上游/运营商，换节点没用；
 // 要是几 MB/s 而节点只有几百 KB/s，问题才在 OpenVPN 传输这一层。
+//
+// 注（0.2.57-fix3 起）：连接关键路径（dialOpenVPNUpstream）不再调用它——
+// 它在拨节点前先跑一轮下载把上游压塞一阵，与慢节点的握手超时互相拖累。
+// 函数保留供需要时显式诊断，进程内 once 守卫也还在，将来谁再接回来仍是
+// 「每个进程只量一次」的语义。
 func diagUnderlaySpeed(ctx context.Context, stack *ipStack, report func(string)) {
 	if stack == nil || report == nil {
 		return
@@ -954,19 +968,35 @@ func dialOpenVPNUpstream(
 	nodeAddr string,
 ) (under *Session, client *ovpn.Client, push *ovpn.PushReply, err error) {
 	// 系统 tun fd 这一轮归 OpenVPN 的包泵，基础协议退成 netstack。
-	under, err = OpenUnderlay(ctx, o)
-	if err != nil {
-		return nil, nil, nil, err
+	//
+	// 上游优先用调用方预建的那条（o.Underlay）。以前每个候选、每次重试都
+	// 在这里新抽一条：端点重新采样，新上游只验过一个 HTTPS 请求，就要撑
+	// 20s 的 OpenVPN 控制通道往返——真机表现是「测速（全程复用一条已验证
+	// 上游）能过的节点，正式连接反而必死」。预建上游的所有权归调用方，
+	// 本函数失败时不关它（closeUnder 只关自建的）。
+	sharedUnderlay := o.Underlay != nil
+	if sharedUnderlay {
+		under = o.Underlay
+	} else {
+		under, err = OpenUnderlay(ctx, o)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	closeUnder := func() {
+		if !sharedUnderlay && under != nil {
+			under.Close()
+		}
 	}
 	stack := under.tn.stack()
 	if stack == nil {
-		under.Close()
+		closeUnder()
 		return nil, nil, nil, errors.New("上游没有 netstack，OpenVPN 外层连接无处可拨（内部错误）")
 	}
-	// 一次性诊断：量「WARP 上游自己」能跑多快（每个进程只量一次）。
-	// 这是判断「慢在上游还是慢在节点/OpenVPN 传输」的唯一可靠办法 ——
-	// 用户的桌面版同样节点能跑 100 Mbps，说明节点本身不慢，必须先把上游量清楚。
-	diagUnderlaySpeed(ctx, stack, o.Report)
+	// 注：连接前的一次性上游测速诊断（diagUnderlaySpeed）已于 0.2.57-fix3
+	// 从这条关键路径摘掉——它在拨节点前先跑 1 流 + 4 流下载，把刚建好的
+	// 上游和跨境带宽先压塞一阵，慢节点更容易在随后的握手里超时。函数
+	// 本体保留，需要诊断时再显式调用。
 
 	// TCP/UDP 都走 gVisor，系统的路由表完全不参与，所以这一步在系统 VPN
 	// 建起来之前就能完成。
@@ -980,7 +1010,7 @@ func dialOpenVPNUpstream(
 	}
 	conn, err := dialThroughStack(ctx, stack, cfg.Proto, nodeAddr, dialTimeout)
 	if err != nil {
-		under.Close()
+		closeUnder()
 		return nil, nil, nil, fmt.Errorf("经 WARP 连接节点失败: %w", err)
 	}
 
@@ -991,7 +1021,7 @@ func dialOpenVPNUpstream(
 	client, err = ovpn.NewClient(clientCfg, packetIO)
 	if err != nil {
 		_ = conn.Close()
-		under.Close()
+		closeUnder()
 		return nil, nil, nil, fmt.Errorf("OpenVPN 客户端初始化失败: %w", err)
 	}
 
@@ -1000,12 +1030,12 @@ func dialOpenVPNUpstream(
 	hsCancel()
 	if err != nil {
 		_ = client.Close()
-		under.Close()
+		closeUnder()
 		return nil, nil, nil, fmt.Errorf("OpenVPN 握手失败: %w", err)
 	}
 	if push == nil || len(push.Prefixes) == 0 {
 		_ = client.Close()
-		under.Close()
+		closeUnder()
 		return nil, nil, nil, errors.New("OpenVPN 握手成功但服务器没有下发 ifconfig 地址")
 	}
 	return under, client, push, nil
