@@ -1601,3 +1601,145 @@ kr-... 握手成功 · 速度未测（没有收到数据（TLS: context deadline
 > 一句话：**判失败只看「有没有数据」，不看「数据够不够多」**。速度只影响排序，
 > 不影响可用性判定 —— 这是 0.2.30 起就定下的口径，0.2.39 补上了「慢节点也要
 > 有机会把第一个字节吐出来」这条时限。
+
+---
+
+## 35. 0.2.40：wwarp / masque-x2 连不上，是不是账号问题？不是
+
+2026-11-11 20:02 日志里两个「连不上」+ 一个「变慢」，三件事互不相干。
+
+### 35.1 wwarp：外层通了，内层选点全灭 —— 却被当成账号失败删了账号
+
+```
+[tunnel] 外层 wg 端点 8.6.112.61:2408 已上线
+[tunnel] 外层已就绪（8.6.112.61:2408），在内层 wg 上选点…
+[tunnel] 候选端点 28 个 × 端口 [...]（wg），预算 1m0s
+[tunnel] 连续 2 次连接失败，已重置本地 WARP 账号      ← 冤枉
+[engine] 连接失败: 在 1m0s 内没有找到可用端点（试了 20 次）
+```
+
+外层已经上线、账号明明可用，只是**内层**（套在外层隧道里的第二条 wg）20 个端点
+一个没握上 —— 这是 UDP-in-UDP 的路径问题，跟账号无关。但 0.2.34 里那条
+「只有基础 WARP 自身失败才怀疑账号」的过滤器，只排除了建 tun / OpenVPN / Psiphon，
+**没排除「内层选点失败」和「用户主动取消」**，于是 streak 到 2 就把 `account.json`
+删了。用户看到的就是「怎么又要注册账号」。
+
+**修法（0.2.40）**：`accountRelated` 再排除两类：
+
+- 错误里含「可用端点」（wwarp / masque-x2 内层选点失败）；
+- `errors.Is(err, context.Canceled)`（自己点的断开）。
+
+### 35.2 masque-x2：外层成功，内层「连上但数据面不通」
+
+```
+MASQUEX2：先拨外层 MASQUE(HTTP/3)…
+162.159.198.1:500 已建立 CONNECT-IP，出口 104.28.245.200 (CN, colo=LAX)   ← 外层 OK
+外层 MASQUE 已就绪，在内层 MASQUE 上选点…
+162.159.198.1:443 已建立 CONNECT-IP → 数据面不通
+162.159.198.2:1701 → 数据面不通
+162.159.198.1:4500 → 数据面不通
+162.159.198.2:8443 → 数据面不通
+```
+
+外层 CONNECT-IP 建得起来、出口也验证通过，说明**账号、凭据、ECDSA 登记全都正常**。
+内层 4 个端点全是「CONNECT-IP 建立成功 → 数据面验证超时」，这是嵌套数据面的问题：
+内层跑在系统 VPN 上（`MASQUE 数据面 = 系统 VPN`），它的验证请求要经过 tun →
+包泵 → 内层加密 → 外层 netstack。这条链现在有一环没接上。
+
+**本轮未修**，只记录。临时办法：用 `masque`（单层）而不是 `masque-x2`。
+
+### 35.3 masque H3 变慢：落地 LAX，不是代码退化
+
+```
+出口 104.28.245.200 (CN, colo=LAX)
+```
+
+出口 IP 一直是同一个（CF 共享 NAT），**决定速度的是落在哪个边缘**。这次中国网络到
+`162.159.198.x` 被路由去了洛杉矶，跨太平洋跑几十兆属于正常；之前跑几百兆时
+落的是 HKG/NRT 这类近处边缘。客户端改不了 colo 的路由选择。
+
+**0.2.40 加了一行提示**，避免用户对着「以前能跑几百兆」反复重试：
+
+```
+提示：本次落地 LAX（跨太平洋），下行通常只有几十兆；想跑满可以换 AWG/WG，
+或断开重连换一个边缘
+```
+
+判据：**看日志里的 `colo=`**。`colo=LAX/SJC/SEA` → 慢是物理距离；`colo=HKG/NRT/SIN`
+还慢，才是真问题（那时再看 `[diag] WARP 上游 1/4 流`）。
+
+---
+
+## 36. 0.2.41：订阅出口（内嵌 mihomo）骨架
+
+目标：新增第三种出口「订阅出口」，与 OpenVPN / 赛风同级，**叠加在 WARP 之上**：
+
+```
+应用 → 系统 tun(fd) → mihomo(tun 入站) → 订阅节点(VLESS/Trojan/HY2…)
+                                          └─ dialer-proxy: warp-bridge（本地 SOCKS5）
+                                               └─ 本引擎的 WARP netstack → 节点
+```
+
+### 36.1 为什么是「WARP → 订阅」，不是「订阅 → WARP」
+
+`dialer-proxy` 的语义是「**这个 outbound 自己的连接**先经过指定代理」。挂在订阅节点上，
+就是「订阅节点经 WARP 拨号」= WARP 前置、订阅节点做最后一跳，出口 IP 是节点所在国。
+反过来（订阅做前置、WARP 做出口）不成立：WARP 是 L3 隧道，没有可供前置拨号的服务器地址，
+而且出口仍是 `104.28.x`（国家不变）。
+
+与电脑版 `type: openvpn` + `dialer-proxy: WARP` 完全同构，只是把 OpenVPN 换成订阅协议。
+
+### 36.2 关键实现：不注册自定义 outbound
+
+mihomo 的 `adapter.ParseProxy` 是固定 switch，没有对外注册扩展点。所以**不写新 outbound**，
+而是用一个 `127.0.0.1` 的 socks5 桥：
+
+```yaml
+proxies:
+  - {name: warp-bridge, type: socks5, server: 127.0.0.1, port: <引擎内部 SOCKS>}
+  - {name: jp-1, type: vless, ..., dialer-proxy: warp-bridge}
+```
+
+这个桥就是引擎已有的「socksPath → WARP netstack」（Psiphon 出口用的同一套），
+`Session.StartInternalSocks` 起监听，`Session.HTTPGet` 负责经 WARP 拉订阅（GitHub raw
+国内直连常被墙）。
+
+### 36.3 三个必须写对的参数
+
+| 参数 | 值 | 不写会怎样 |
+|---|---|---|
+| `tun.file-descriptor` | VpnService 建好的 fd | 内核自己建网卡 → Android 上没有权限，直接失败 |
+| `tun.auto-route` / `auto-detect-interface` | `false` | 内核去改系统路由，和 VpnService 的路由表打架 |
+| `interface-name` | 物理网卡（wlan0/rmnet_data0） | 内核的 DNS/直连被自己的 VPN 抓回去 → 死循环 |
+
+### 36.3b 真机踩到：`interface-name` 取到了 `tun0`
+
+第一次连接日志是 `物理网卡 = wlan0`（正常），第二次变成 **`tun0`** —— 因为
+`ConnectivityManager.activeNetwork` 在 VPN 建起来之后就是**我们自己的 tun**。
+把它当 `interface-name` 交给 mihomo，内核所有出口 socket 会写回自己的 tun：
+表现正是用户报的「状态栏有 VPN 图标、首页显示未连接、所有网站打不开」。
+
+修法：遍历 `allNetworks`，**排除 `TRANSPORT_VPN`**，优先 Wi-Fi、其次蜂窝。
+
+同一轮还修了「点了按钮没反应」：订阅出口不走 `Engine.connect`，会话状态一直停在
+idle，首页因此永远显示「未连接」。新增 `MarkSubExitConnected/Stopped`，
+在启动成功/关闭时显式转 `connecting → connected` 与 `stopping → idle`。
+
+### 36.4 体积
+
+mihomo 全家桶（含 sing-tun、sing、quic、bbolt）让 `libgojni.so` 从 20 MB 涨到 71 MB。
+处理：**只打 arm64 + `-ldflags=-w -s`**，APK 从 170 MB 降到 **87.6 MB**（原来 69 MB）。
+代价是不再支持 armeabi-v7a（2026 年的设备基本是 arm64）。
+
+### 36.5 本轮做到哪、没做到哪
+
+| 项 | 状态 |
+|---|---|
+| 内嵌 mihomo、按国家分片拉订阅（内置 by-country + 自定义地址） | ✅ |
+| tun fd 接管、WARP 前置（socks5 桥）、防环路 | ✅ |
+| 设置页：开关 + 国家下拉 + 自定义订阅输入 | ✅ |
+| **测速选最快**（同国多个节点里挑最快的） | ⬜ 下一轮（当前取订阅里的第一个） |
+| **失效自动切换**（同国顺延 / 整国回退 WARP） | ⬜ 下一轮 |
+
+> 判据：选「日本」连上后，`https://chatgpt.com/cdn-cgi/trace` 的 `loc=JP`。
+> 注意公开订阅节点大量被 AI 风控拉黑，`loc` 对了也可能提示 unusual activity。
