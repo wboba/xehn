@@ -1144,18 +1144,26 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// maxTCPResetRetransmits 是 TCP 模式下 waitServerReset 重发 hard reset 的
+// 上限。UDP 的可靠层会一直重传到窗口结束；TCP 以前是整窗单次阻塞读——
+// reset 应答在跨境链路上丢一次，这次握手就必死（错误里永远是
+// "after 0 retransmits"）。0.2.57-fix3 起 TCP 也分片读 + 重传，但封顶：
+// TCP 是字节流，重发几次还等不到应答，就是对端不打算回了。
+const maxTCPResetRetransmits = 3
+
 func (c *Client) waitServerReset(ctx context.Context) error {
 	retransmits := 0
 	for {
-		readCtx := ctx
-		cancel := func() {}
-		if c.config.Proto == ProtoUDP {
-			readCtx, cancel = context.WithTimeout(ctx, ControlRetransmitDelay)
-		}
+		// UDP 和 TCP 都把读切成 ControlRetransmitDelay 小片：片到期就重发
+		// 还没被确认的 hard reset，而不是整窗干等一次读的结果。
+		readCtx, cancel := context.WithTimeout(ctx, ControlRetransmitDelay)
 		packet, err := c.control.Read(readCtx)
 		cancel()
 		if err != nil {
-			if c.config.Proto == ProtoUDP && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				if c.config.Proto == ProtoTCP && retransmits >= maxTCPResetRetransmits {
+					return fmt.Errorf("read hard reset response after %d retransmits: %w", retransmits, err)
+				}
 				if err := c.control.RetransmitPending(ctx); err != nil {
 					return fmt.Errorf("retransmit hard reset: %w", err)
 				}
