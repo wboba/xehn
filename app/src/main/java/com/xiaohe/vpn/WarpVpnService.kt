@@ -4,7 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.content.pm.ServiceInfo
 import android.net.IpPrefix
 import android.net.VpnService
@@ -135,6 +138,15 @@ class WarpVpnService : VpnService() {
          */
         private const val OPENVPN_TUN_LOCAL = "192.0.2.111"
 
+        /**
+         * 订阅出口时系统 tun 的地址。
+         *
+         * 现在 tun 由**我们自己的 gVisor 栈**读写（tun2socks），本地地址就是它
+         * 认的 172.16.0.2 —— 与普通 WARP 模式一致。mihomo 不再碰 tun
+         * （它自带的 tun 在非 root Android 上必然失败）。
+         */
+        private const val SUB_TUN_V4 = "198.18.0.1"
+
         /** 看门狗多久看一次快照。 */
         private const val WATCHDOG_TICK_MS = 5_000L
         /** 自动重连的统计窗口与上限：5 分钟内最多 3 次。 */
@@ -233,6 +245,13 @@ class WarpVpnService : VpnService() {
 
     /** 关闭系统 tun（幂等）。只有这里关 —— 引擎侧一律不关。 */
     private fun closeTun() {
+        // 订阅出口：内核握着 tun fd，必须先停内核再关 fd
+        // （sing-tun 对着已关闭的 fd 读写会刷一串 "use of closed file"）。
+        EngineBridge.peek()?.let { e ->
+            runCatching { e.stopSubExit() }
+            // 会话状态也要收回去，否则断开后首页还显示「已连接」。
+            runCatching { e.markSubExitStopped() }
+        }
         val p = tunPfd ?: return
         tunPfd = null
         tunFd = -1
@@ -444,6 +463,57 @@ class WarpVpnService : VpnService() {
                     } + "）"
             )
             EngineBridge.refresh(e)
+        }
+
+        // 2.5) 订阅出口：tun 已经建好，交给内嵌 mihomo 接管，不再走 connectLoop。
+        //
+        //     数据路径（与电脑版 openvpn + dialer-proxy 同构）：
+        //       系统 tun → mihomo → 订阅节点 → dialer-proxy(本地 SOCKS) → WARP → 节点
+        //     所以这里只需把 fd 和「国家/订阅地址/物理网卡」交给引擎，剩下的它自己做。
+        if (s.subExit && !psiphon && !openvpn) {
+            connectJob?.cancel()
+            EngineBridge.note(
+                "[subout] 订阅出口：国家=${s.subCountry}，订阅=" +
+                    (if (s.subCustomURL.isBlank()) "内置分片" else s.subCustomURL)
+            )
+            connectJob = scope.launch {
+                try {
+                    // 立刻转「连接中」：建上游 + 拉订阅要十几秒，这段必须有状态反馈。
+                    runCatching { e.markSubExitConnecting() }
+                    EngineBridge.refresh(e)
+                    val iface = activeInterfaceName()
+                    if (iface.isNotEmpty()) {
+                        EngineBridge.note("[subout] 物理网卡 = $iface（内核出口绑它，避免被自己的 VPN 抓走）")
+                    }
+                    val r = withContext(Dispatchers.IO) {
+                        e.startSubExit(proto, tunFd.toLong(), s.subCountry, s.subCustomURL, iface)
+                    }
+                    EngineBridge.note("[subout] $r")
+                    if (!r.startsWith("订阅出口已启动")) {
+                        runCatching { e.stopSubExit() }
+                        runCatching { e.markSubExitStopped() }
+                        closeTun()
+                        e.setVPNState(false)
+                        EngineBridge.refresh(e)
+                        stopForegroundCompat()
+                        stopSelf()
+                        return@launch
+                    }
+                    // 数据面由 mihomo 接管，不经过 Engine.connect，所以要显式把会话
+                    // 置成「已连接」—— 否则首页一直停在「未连接」，看起来像按钮没反应。
+                    runCatching { e.markSubExitConnected(s.subCountry) }
+                    e.setVPNState(true)
+                    EngineBridge.refresh(e)
+                } catch (t: Throwable) {
+                    EngineBridge.note("[subout] 订阅出口异常：${t.javaClass.simpleName}: ${t.message}")
+                    runCatching { e.stopSubExit() }
+                    closeTun()
+                    e.setVPNState(false)
+                    EngineBridge.refresh(e)
+                }
+                updateNotification()
+            }
+            return
         }
 
         // 出口地区必须在 connect 之前下发：它是 tunnel-core 的启动参数（EgressRegion），
@@ -1124,11 +1194,21 @@ class WarpVpnService : VpnService() {
         // 每次都一样的是 v6 地址 `fd00:1:...`，所以它最容易撞；v4 的 172.16.0.2
         // **不能换**（引擎的 netstack 设备地址固定是它，换了回程包在内核里没有归属，
         // 等于连上就断），能换的只有「要不要 v6」+「等一会儿再试」。
+        // 订阅出口：tun 地址必须和内核期望的一致。
+        //
+        // mihomo 的 tun 本地地址取自 dns.FakeIPRange（默认 198.18.0.1/16，取 /30），
+        // 也就是 **198.18.0.1/30**；而普通模式的 172.16.0.2 是 WARP netstack 的设备
+        // 地址。两者不一致时 gvisor 栈不认这个网卡，包会被静默丢弃 ——
+        // 现象正是用户报的「已连接、出口 IP 获取中、上下行 0 B/s」。
+        // 订阅出口：tun 地址必须等于 mihomo 的 tun 本地地址（dns.FakeIPRange 取 /30
+        // → 198.18.0.1/30），否则 gVisor 栈不认这张网卡。
+        val tunV4 = if (s.subExit) SUB_TUN_V4 else TUN_ADDR_V4
+        val tunBits = if (s.subExit) 30 else 32
         val variants = buildList {
-            add(TunVariant(TUN_ADDR_V4, true, "默认地址 + v6"))
+            add(TunVariant(tunV4, true, if (s.subExit) "订阅出口地址 + v6" else "默认地址 + v6"))
             if (!s.ipv6) {
-                add(TunVariant(TUN_ADDR_V4, false, "不带 v6"))
-                add(TunVariant(TUN_ADDR_V4, false, "不带 v6，等旧接口回收后重试"))
+                add(TunVariant(tunV4, false, "不带 v6"))
+                add(TunVariant(tunV4, false, "不带 v6，等旧接口回收后重试"))
             }
         }
         var last: Throwable? = null
@@ -1143,7 +1223,7 @@ class WarpVpnService : VpnService() {
                     .setSession(getString(R.string.app_name))
                     .setMtu(mtu)
                     .setBlocking(true)
-                vpnStep("addAddress(${v.addr}/32)") { b.addAddress(v.addr, 32) }
+                vpnStep("addAddress(${v.addr}/$tunBits)") { b.addAddress(v.addr, tunBits) }
 
                 // 路由策略：VpnService 只有一种表达方式 —— **加了路由的网段才进 tun**，
                 // 没加的直接走物理网卡。三种规则模式就是三份路由集合。
@@ -1464,6 +1544,34 @@ class WarpVpnService : VpnService() {
         }
         return dns
     }
+
+    /**
+     * 当前**物理网络**的网卡名（wlan0 / rmnet_data0 …）；拿不到返回空串。
+     *
+     * 不能用 `activeNetwork`：系统 VPN 建起来之后它就是我们自己的 tun（日志里
+     * 第二次连接拿到的是 `tun0`），把它交给 mihomo 当 interface-name，内核的
+     * 所有出口 socket 会直接写回自己的 tun —— 表现就是「VPN 图标亮着、所有网站
+     * 打不开」。所以这里遍历全部网络，**排除 VPN 传输类型**，优先 Wi-Fi、其次蜂窝。
+     */
+    private fun activeInterfaceName(): String = runCatching {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return@runCatching ""
+        val physical = cm.allNetworks
+            .mapNotNull { n ->
+                val caps = cm.getNetworkCapabilities(n) ?: return@mapNotNull null
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return@mapNotNull null
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@mapNotNull null
+                val score = when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 2
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 1
+                    else -> 0
+                }
+                cm.getLinkProperties(n)?.interfaceName?.takeIf { it.isNotBlank() }?.let { it to score }
+            }
+            .maxByOrNull { it.second }
+            ?.first
+        physical ?: cm.getLinkProperties(cm.activeNetwork ?: return@runCatching "")?.interfaceName.orEmpty()
+    }.getOrDefault("")
 
     /** 只把 IP 字面量转成地址，主机名一律返回 null（避免触发一次真实解析）。 */
     private fun ipLiteral(s: String): InetAddress? {
