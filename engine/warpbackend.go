@@ -277,6 +277,32 @@ func (b *warpBackend) connectOpenVPN(
 	prefer := b.preferEndpoint(req.Proto)
 	ids = b.freshOpenVPNIDs(ids, report)
 
+	// 先建一条 WARP 上游，本轮全部候选（以及 DialOpenVPN 内部的握手重试）
+	// 共用，与 TestOpenVPNNodes 同口径。以前每个候选各拨一条新上游：端点
+	// 重新采样，新上游只验过一个 HTTPS 请求就要撑 20s 的 OpenVPN 控制
+	// 通道往返——真机表现就是「测速能过、连接必死」。所有权在本函数：
+	// 全部候选失败（或中途退出）时关掉它；成功时它就是交出去的 Session，
+	// 所有权随连接转交，不关。
+	under, err := warp.OpenUnderlay(ctx, warp.OpenVPNOptions{
+		UnderlayProto:    req.Proto,
+		UnderlayEndpoint: req.Endpoint,
+		UnderlayPrefer:   prefer,
+		IPv6:             req.IPv6,
+		HandshakeTimeout: handshake,
+		VerifyTimeout:    10 * time.Second,
+		Budget:           60 * time.Second,
+		Report:           report,
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	connected := false
+	defer func() {
+		if !connected {
+			under.Close()
+		}
+	}()
+
 	tried := 0
 	var lastErr error
 	for _, id := range ids {
@@ -303,6 +329,7 @@ func (b *warpBackend) connectOpenVPN(
 			HandshakeTimeout: handshake,
 			VerifyTimeout:    10 * time.Second,
 			Budget:           60 * time.Second,
+			Underlay:         under,
 			PrepareTun:       prepare,
 			// 本地代理 / 局域网共享（节点出口时也要能开）。
 			SocksListen: socksListen,
@@ -320,6 +347,8 @@ func (b *warpBackend) connectOpenVPN(
 			b.mu.Lock()
 			b.session = sess
 			b.mu.Unlock()
+			// sess 就是预建的 under：所有权随连接转交，defer 不要关它。
+			connected = true
 			return Result{
 				ExitIP:   sess.ExitIP,
 				Country:  exitCountry,
