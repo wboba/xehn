@@ -162,22 +162,14 @@ class WarpVpnService : VpnService() {
         private const val OPENVPN_CANDIDATE_CAP = 24
 
         /**
-         * 一次点击最多试几个节点（每个节点一次 connect；establish 只在握手
-         * 成功后发生一次）。
+         * 一次点击最多试几个节点（每个节点一次 connect、一次 establish）。
          *
          * 原来是「一次 connect 里引擎连试 5 个」，真机日志显示进程总是在同一次连接
-         * 的第 3~5 次建立系统 VPN 之后直接消失（0.2.4 第 5 次、0.2.5 第 4 次/第 3 次），
-         * 所以一度改成一次只建一次系统 VPN，并把单次点击的上限压到 3，先把
-         * 「反复 establish」这个变量摘掉。
-         *
-         * 0.2.57-fix4 起放宽到 8：fix3 之后握手失败的尝试根本走不到建系统 VPN
-         * 那一步（establish 只在握手成功后由引擎回调触发，一次点击至多在连上时
-         * 建一次），而且 TCP 死节点靠 reset 分片重传约 4 秒就能判死，多试几个死
-         * 节点的代价只是几秒等待，不再是反复建 VPN。上限仍保留：候选再多也不能
-         * 无限试下去，把用户晾在「连接中」。失败记忆还在（引擎侧 10 分钟），
-         * 下次点击自然会换别的节点。
+         * 的第 3~5 次建立系统 VPN 之后直接消失（0.2.4 第 5 次、0.2.5 第 4 次/第 3 次）。
+         * 改成一次只建一次系统 VPN，并把单次点击的上限压到 3，先把「反复 establish」
+         * 这个变量摘掉；失败记忆还在（引擎侧 10 分钟），下次点击自然会换别的节点。
          */
-        private const val OPENVPN_MAX_TRIES = 8
+        private const val OPENVPN_MAX_TRIES = 3
 
         /**
          * 出口测速要下载的字节数 —— 与电脑版 `openvpnSpeedProbeBytes` 一致（512 KiB）。
@@ -626,8 +618,6 @@ class WarpVpnService : VpnService() {
         var attempts = 0
         /** 因速度被指定换过去的节点（见下面 faster 的判定）。 */
         var preferId: String? = null
-        /** 钉死节点失败后切到同国兜底的日志只写一次，别每个兜底节点都刷一行。 */
-        var pinnedFallbackNoted = false
 
         while (true) {
             val nodes = EngineBridge.vpnGateNodes(this)
@@ -655,8 +645,7 @@ class WarpVpnService : VpnService() {
             if (first == null) {
                 teardownAfterFailure(
                     if (pinnedId.isNotEmpty()) {
-                        "固定节点和它同国家的 ${tried.size} 个候选都试过了，本次停止" +
-                            "（不会自动换国家；你可以换一个固定节点或改回自动）"
+                        "固定节点连接失败，本次不再自动换别的节点（你可以换一个固定节点或改回自动）"
                     } else {
                         "本次试过的 ${tried.size} 个节点都失败了，停止重试（失败的节点 10 分钟内不再尝试）"
                     }
@@ -666,18 +655,12 @@ class WarpVpnService : VpnService() {
             if (attempts >= OPENVPN_MAX_TRIES) {
                 teardownAfterFailure(
                     "本次已试 $attempts 个节点都没成功，先停在这里" +
-                        "（每次点击最多试 $OPENVPN_MAX_TRIES 个；握手失败的尝试不会建系统 VPN，但也不能无限试下去）"
+                        "（每次点击最多试 $OPENVPN_MAX_TRIES 个，避免反复建系统 VPN 把进程搞死）"
                 )
                 return
             }
             attempts++
             tried.add(first.id)
-            if (pinnedId.isNotEmpty() && first.id != pinnedId && !pinnedFallbackNoted) {
-                pinnedFallbackNoted = true
-                EngineBridge.note(
-                    "[vpn] 固定节点没连上，改在同一国家（${first.cc}）内按排名继续试，不会换国家"
-                )
-            }
             EngineBridge.note(
                 "[vpn] 本次第 $attempts/$OPENVPN_MAX_TRIES 个，候选共 ${ranked.size} 个：" +
                     "${nodeSlotLabel(nodes, first)}" +
@@ -906,7 +889,7 @@ class WarpVpnService : VpnService() {
     /**
      * 按设置排出候选节点。**用户选了哪里就只在哪里**：
      *
-     *  - 钉死节点 → 该节点排第一，它失败后在**同国家**内按排名兜底（仍不越境）；
+     *  - 钉死节点 → 只返回该节点（1 个）；
      *  - 只钉了国家 → 只返回该国节点，绝不越境；
      *  - 都没钉（自动）→ 所有国家按同一套顺序排。
      *
@@ -939,13 +922,8 @@ class WarpVpnService : VpnService() {
         // 否则用户看到的「JP家宽03」和实际连的节点会对不上）。
         fun sortedOf(pool: List<VpnGateNode>): List<VpnGateNode> = pool.sortedWith(vpnGateNodeOrder)
 
-        // 1) 钉死节点：用户点名了，它排第一优先试；它失败后只在**同一国家**
-        //    内按排名兜底 —— 绝不偷偷换国家。2026-11-01 用户指定美国却被连到
-        //    韩国，就是这里原来会把「境外」补在后面；同国兜底不越境，不重蹈覆辙。
-        //    （0.2.57-fix4 之前这里只返回固定节点 1 个，它一失败整次点击就收场，
-        //    用户只能反复手点下一个。）
-        //    固定节点本身不在列表里、或刚测出握手失败时，仍按老规矩报错返回空：
-        //    那是「选的节点已失效」，不是「连不上」，不该拿兜底掩盖过去。
+        // 1) 钉死节点：用户点名了，就**只**试它。失败就报错 —— 绝不偷偷换国家。
+        //    2026-11-01 用户指定美国却被连到韩国，就是这里原来会把「境外」补在后面。
         if (s.openvpnNodeId.isNotEmpty()) {
             val fixed = nodes.firstOrNull { it.id == s.openvpnNodeId }
             if (fixed == null) {
@@ -961,13 +939,7 @@ class WarpVpnService : VpnService() {
                 )
                 return emptyList()
             }
-            // 同国兜底：其余 usable 节点按 vpnGateNodeOrder 排（与设置页编号
-            // 同一套顺序），固定节点排第一、按 id 去重；总量与国家/自动分支
-            // 一样封顶 OPENVPN_CANDIDATE_CAP。
-            val sameCountry = nodes.filter {
-                it.id != fixed.id && it.cc.equals(fixed.cc, ignoreCase = true) && usable(it)
-            }
-            return (listOf(fixed) + sortedOf(sameCountry)).take(OPENVPN_CANDIDATE_CAP)
+            return listOf(fixed)
         }
 
         // 2) 只钉了国家：同样只在该国里挑，越境一律不做。
