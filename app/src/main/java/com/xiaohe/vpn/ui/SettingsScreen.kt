@@ -1294,6 +1294,28 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
             tailColor = MaterialTheme.colorScheme.onSurfaceVariant
         }
     }
+    // IP 质量只看这个 IP 是不是住宅，不看延迟：纯住宅最好，共享住宅次之，
+    // 机房最差。cls 是引擎按 ASN / 运营商判的类别，shared 表示多人共用同一出口。
+    val quality: String
+    val qualityColor: androidx.compose.ui.graphics.Color
+    when {
+        n.cls == "residential" && !n.shared -> {
+            quality = "纯住宅"
+            qualityColor = Color(0xFF1B7F3B)
+        }
+        n.cls == "residential" -> {
+            quality = "共享住宅"
+            qualityColor = Color(0xFFB26A00)
+        }
+        n.cls == "datacenter" -> {
+            quality = "机房"
+            qualityColor = Color(0xFF8A6D3B)
+        }
+        else -> {
+            quality = "未知"
+            qualityColor = MaterialTheme.colorScheme.onSurfaceVariant
+        }
+    }
     Row(
         Modifier
             .fillMaxWidth()
@@ -1314,6 +1336,13 @@ private fun OpenVpnNodeRow(slot: String, n: VpnGateNode, selected: Boolean, onCl
                 "datacenter" -> Color(0xFF8A6D3B)
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             },
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            quality,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            color = qualityColor,
         )
         Spacer(Modifier.width(8.dp))
         Text(
