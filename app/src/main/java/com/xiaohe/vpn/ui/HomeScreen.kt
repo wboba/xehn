@@ -102,15 +102,15 @@ fun HomeScreen(
         }
     }
 
-    // 运行时长和速率要连续变化，所以按秒轮询；空闲时刷一次就够。
-    LaunchedEffect(state.isConnected, state.isBusy) {
-        if (state.isConnected || state.isBusy) {
-            while (true) {
-                EngineBridge.refresh()
-                delay(1_000)
-            }
-        } else {
+    // 运行时长和速率要连续变化，所以按秒轮询。必须无条件轮询：连接状态会被
+    // 后台服务改变（看门狗重连、慢节点换点、订阅出口标记），只在「已连接 /
+    // 连接中」时才轮询的话，某次读到未连接就停查了，之后真连上也发现不了，
+    // 首页会一直卡在「未连接」（2026-11-15 真机实测：隧道已通、流量在走，
+    // 首页仍显示未连接）。statusJSON 只是读一份快照，每秒一次开销可忽略。
+    LaunchedEffect(Unit) {
+        while (true) {
             EngineBridge.refresh()
+            delay(1_000)
         }
     }
 
