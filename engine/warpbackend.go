@@ -277,32 +277,6 @@ func (b *warpBackend) connectOpenVPN(
 	prefer := b.preferEndpoint(req.Proto)
 	ids = b.freshOpenVPNIDs(ids, report)
 
-	// 先建一条 WARP 上游，本轮全部候选（以及 DialOpenVPN 内部的握手重试）
-	// 共用，与 TestOpenVPNNodes 同口径。以前每个候选各拨一条新上游：端点
-	// 重新采样，新上游只验过一个 HTTPS 请求就要撑 20s 的 OpenVPN 控制
-	// 通道往返——真机表现就是「测速能过、连接必死」。所有权在本函数：
-	// 全部候选失败（或中途退出）时关掉它；成功时它就是交出去的 Session，
-	// 所有权随连接转交，不关。
-	under, err := warp.OpenUnderlay(ctx, warp.OpenVPNOptions{
-		UnderlayProto:    req.Proto,
-		UnderlayEndpoint: req.Endpoint,
-		UnderlayPrefer:   prefer,
-		IPv6:             req.IPv6,
-		HandshakeTimeout: handshake,
-		VerifyTimeout:    10 * time.Second,
-		Budget:           60 * time.Second,
-		Report:           report,
-	})
-	if err != nil {
-		return Result{}, err
-	}
-	connected := false
-	defer func() {
-		if !connected {
-			under.Close()
-		}
-	}()
-
 	tried := 0
 	var lastErr error
 	for _, id := range ids {
@@ -329,7 +303,6 @@ func (b *warpBackend) connectOpenVPN(
 			HandshakeTimeout: handshake,
 			VerifyTimeout:    10 * time.Second,
 			Budget:           60 * time.Second,
-			Underlay:         under,
 			PrepareTun:       prepare,
 			// 本地代理 / 局域网共享（节点出口时也要能开）。
 			SocksListen: socksListen,
@@ -347,8 +320,6 @@ func (b *warpBackend) connectOpenVPN(
 			b.mu.Lock()
 			b.session = sess
 			b.mu.Unlock()
-			// sess 就是预建的 under：所有权随连接转交，defer 不要关它。
-			connected = true
 			return Result{
 				ExitIP:   sess.ExitIP,
 				Country:  exitCountry,
@@ -483,12 +454,11 @@ func (b *warpBackend) TestOpenVPNNodes(
 	}
 	defer under.Close()
 
-	// 并发 6、单节点 15s：真机实测好看的节点握手 2.8–4.9s，但慢节点（尤其日本
-	// 家宽）握手能到 12.5s（见 openvpn.go handshakeWindow 处的实测注），10s 会
-	// 把它们在列表阶段就误判掉。fork 于 2026-11-12 把上限抬到 15s：98 个节点
-	// 最坏 98×15/6 ≈ 4 分钟，实际大多在 1 分钟内（只有死节点才等满超时）。
-	const probeTimeout = 15 * time.Second
-	// 并发 8：每个节点是「握手 + 2s 测速」，98 个最坏约 98×(15+2)/8 ≈ 3.5 分钟。
+	// 并发 6、单节点 10s：真机实测好看的节点握手 2.8–4.9s，10s 足够分辨；
+	// 而「控制通道无响应」的节点一定要等满超时，所以并发数直接决定总时长 ——
+	// 98 个节点最坏 98×10/6 ≈ 2.7 分钟，实际大多在 1 分钟内。
+	const probeTimeout = 10 * time.Second
+	// 并发 8：每个节点是「握手 + 2s 测速」，98 个最坏约 98×(10+2)/8 ≈ 2.5 分钟。
 	const workers = 8
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
@@ -657,20 +627,6 @@ func loadEndpointCache(path string) map[string]string {
 // 网络 RTT 更大，给到 3s，否则好端点会被自己的超时误判掉。
 const defaultHandshakeTimeout = 3 * time.Second
 
-// currentHandshake 返回当前配置的单端点握手超时（未设置时用默认值）。
-//
-// fork 修正（2026-11-12）：此前多条路径把 3s 写死或传 0（如引擎的节点测速
-// 入口传 0、Psiphon 两处写死 3s），用户在设置里调大的超时永远传不到那些
-// 路径——慢端点在那些路径上被 3s 误杀，用户却以为是自己的设置没生效。
-func (b *warpBackend) currentHandshake() time.Duration {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.handshake <= 0 {
-		return defaultHandshakeTimeout
-	}
-	return b.handshake
-}
-
 // SetTimeout 设置单端点握手超时（秒）。0 表示用默认值。
 func (b *warpBackend) SetTimeout(sec int) {
 	b.mu.Lock()
@@ -781,7 +737,7 @@ func (b *warpBackend) RefreshPsiphonRegions(ctx context.Context, report func(str
 		DNS:              dns,
 		DataDir:          filepath.Join(b.workDir, "psiphon"),
 		UnderlayProto:    "awg",
-		HandshakeTimeout: b.currentHandshake(),
+		HandshakeTimeout: 3 * time.Second,
 		Budget:           70 * time.Second,
 		RegionsOnly:      true,
 		Report:           report,
@@ -846,7 +802,7 @@ func (b *warpBackend) ProbePsiphonRegions(
 	report("地区测速：先建一条 WARP 上游（各地区共用）…")
 	under, err := warp.OpenPsiphonUnderlay(budgetCtx, warp.PsiphonOptions{
 		UnderlayProto:    "awg",
-		HandshakeTimeout: b.currentHandshake(),
+		HandshakeTimeout: 3 * time.Second,
 		VerifyTimeout:    10 * time.Second,
 		Budget:           60 * time.Second,
 		Report:           report,
