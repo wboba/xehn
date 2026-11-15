@@ -16,7 +16,7 @@ android {
         // 缓存图标，版本号不变时覆盖安装会继续显示旧图标。
         // 规矩（见 docs/pitfalls.md 第 5 节）：每轮改动都要 +1，并在版本说明里写清这一版
         // 相对上一版变/没变什么。启动器按「包名 + versionCode」缓存图标，不递增会显示旧图标。
-        versionCode = 65
+        versionCode = 66
         versionName = "0.2.57"
 
         // 只出 arm64 + arm。x86_64 仅在模拟器上有意义，需要额外跑一次
