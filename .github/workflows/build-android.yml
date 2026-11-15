@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - xehn-android
+      - official-0.2.57
 
 jobs:
   build:
@@ -13,10 +13,10 @@ jobs:
       GOTOOLCHAIN: go1.26.10
       JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8
     steps:
-      - name: Checkout (xehn-android)
+      - name: Checkout (official-0.2.57)
         uses: actions/checkout@v4
         with:
-          ref: xehn-android
+          ref: official-0.2.57
 
 
       - name: Setup JDK 17
